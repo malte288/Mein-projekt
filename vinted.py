@@ -1,13 +1,6 @@
 """
-Vinted-Datenquelle für den Discord-Sniper.
-
-Nutzt die öffentliche Vinted-Katalog-Schnittstelle. Es werden keine
-CAPTCHA-, Login- oder Anti-Bot-Umgehungen eingebaut.
-
-Konfiguration über Railway-Variablen:
-- VINTED_DOMAIN=de       (z.B. de, fr, nl, it)
-- VINTED_PER_PAGE=96
-- VINTED_TIMEOUT=4
+Vinted source using a normal anonymous public web session.
+No Vinted login, CAPTCHA bypass, proxy rotation, or credential handling.
 """
 
 import os
@@ -18,11 +11,43 @@ class VintedSource:
     def __init__(self):
         domain = os.getenv("VINTED_DOMAIN", "de").strip().lower()
         domain = domain.replace("https://", "").replace("http://", "").strip("/")
-        self.base_url = f"https://www.vinted.{domain}"
+        host = domain if domain.startswith("www.") else f"www.vinted.{domain}"
+
+        self.base_url = f"https://{host}"
         self.per_page = max(20, min(96, int(os.getenv("VINTED_PER_PAGE", "96"))))
-        self.timeout = max(2, float(os.getenv("VINTED_TIMEOUT", "4")))
+        self.timeout_seconds = max(3.0, float(os.getenv("VINTED_TIMEOUT", "5")))
+        self.session = None
+
+    async def _session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/json",
+                    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                },
+            )
+        return self.session
+
+    async def _bootstrap(self, session):
+        async with session.get(
+            f"{self.base_url}/catalog",
+            params={"order": "newest_first"},
+        ) as response:
+            await response.read()
+            return response.status
 
     async def search_new(self, query):
+        session = await self._session()
+
+        # Establish a normal anonymous web session first.
+        bootstrap_status = await self._bootstrap(session)
+
         params = {
             "search_text": query,
             "order": "newest_first",
@@ -31,32 +56,27 @@ class VintedSource:
             "currency": "EUR",
         }
 
-        url = f"{self.base_url}/api/v2/catalog/items"
+        async with session.get(
+            f"{self.base_url}/api/v2/catalog/items",
+            params=params,
+        ) as response:
+            if response.status in (401, 403, 429):
+                raise RuntimeError(
+                    f"Vinted HTTP {response.status} after public session "
+                    f"(catalog page returned {bootstrap_status})."
+                )
 
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0",
-        }
+            if response.status != 200:
+                raise RuntimeError(f"Vinted HTTP {response.status}")
 
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status in (401, 403, 429):
-                        raise RuntimeError(
-                            f"Vinted antwortete mit HTTP {response.status}. "
-                            "Die öffentliche Quelle ist momentan nicht direkt erreichbar."
-                        )
-                    if response.status != 200:
-                        raise RuntimeError(f"Vinted HTTP {response.status}")
+            data = await response.json(content_type=None)
 
-                    data = await response.json(content_type=None)
-
-            raw_items = data.get("items", []) if isinstance(data, dict) else []
-            return [self._normalize(item) for item in raw_items if item.get("id")]
-
-        except aiohttp.ClientError as exc:
-            raise RuntimeError(f"Vinted-Verbindung fehlgeschlagen: {exc}") from exc
+        items = data.get("items", []) if isinstance(data, dict) else []
+        return [
+            self._normalize(item)
+            for item in items
+            if isinstance(item, dict) and item.get("id")
+        ]
 
     @staticmethod
     def _normalize(item):
@@ -85,9 +105,10 @@ class VintedSource:
             if x.strip()
         }
 
-        item_size = str(item.get("size", "")).strip().lower()
-        if wanted_sizes and item_size not in wanted_sizes:
-            return False
+        if wanted_sizes:
+            item_size = str(item.get("size", "")).strip().lower()
+            if item_size not in wanted_sizes:
+                return False
 
         if max_price is not None:
             try:
@@ -97,9 +118,13 @@ class VintedSource:
                 return False
 
         if condition:
-            wanted = condition.strip().lower()
-            actual = str(item.get("condition", "")).lower()
-            if wanted not in actual:
+            if condition.strip().lower() not in str(
+                item.get("condition", "")
+            ).lower():
                 return False
 
         return True
+
+    async def close(self):
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
