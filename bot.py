@@ -459,6 +459,33 @@ def get_image_urls(item):
     return result[:10]
 
 
+def listing_timestamp(created_at):
+    """Return a Discord Unix timestamp for Vinted's creation date."""
+    if created_at is None:
+        return None
+
+    try:
+        if isinstance(created_at, (int, float)):
+            # Vinted may expose seconds or milliseconds.
+            value = float(created_at)
+            if value > 10_000_000_000:
+                value /= 1000
+            return int(value)
+
+        text = str(created_at).strip()
+        if not text:
+            return None
+
+        # ISO 8601, including trailing Z.
+        normalized = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 async def download_images(urls):
     """
     Laedt die Bilder herunter, damit Discord sie als eine
@@ -636,9 +663,16 @@ async def send_alert(
             inline=False,
         )
 
-    embed.set_footer(
-        text=f"Erkannt nach {detected_at:.2f}s"
-    )
+    # Discord kann einen relativen Timestamp selbst laufend aktualisieren.
+    # Dadurch steht unten z. B. "Online seit 2 Minuten", ohne dass der Bot
+    # die Nachricht jede Sekunde editieren muss.
+    created_ts = listing_timestamp(item.get("created_at"))
+
+    footer_text = f"Erkannt nach {detected_at:.2f}s"
+    if created_ts:
+        footer_text += f" â¢ Online seit <t:{created_ts}:R>"
+
+    embed.set_footer(text=footer_text)
 
     # --------------------------------------------------------
     # ALLE BILDER HOLEN
@@ -647,13 +681,11 @@ async def send_alert(
     image_urls = get_image_urls(item)
     files = await download_images(image_urls)
 
-    # Das erste Bild wird als Embed-Bild gesetzt.
-    # Die restlichen Bilder bleiben Attachments in derselben
-    # Discord-Nachricht.
-    if files:
-        embed.set_image(
-            url="attachment://vinted_1.jpg"
-        )
+    # Alle Bilder bleiben Attachments in EINER Nachricht.
+    # Discord Mobile zeigt mehrere Bilder derselben Nachricht als Galerie;
+    # beim Oeffnen des ersten Bildes kann man zwischen den Bildern wischen.
+    # Wir setzen absichtlich KEIN embed.set_image(), damit Discord die
+    # Attachments als gemeinsame Mediengalerie behandelt.
 
     # --------------------------------------------------------
     # EINE NACHRICHT SENDEN
@@ -663,14 +695,7 @@ async def send_alert(
         embed=embed,
         view=ListingView(url),
         files=files if files else [],
-    )
-
-    # --------------------------------------------------------
-    # NACH 20 MINUTEN LOESCHEN
-    # --------------------------------------------------------
-
-    asyncio.create_task(
-        delete_after_delay(message)
+        delete_after=DELETE_AFTER,
     )
 
     # --------------------------------------------------------
@@ -902,6 +927,10 @@ async def monitor():
                         max_price,
                         condition,
                     ):
+
+                        # Erst jetzt die Detaildaten holen: komplette Galerie
+                        # + echtes Erstellungsdatum des Angebots.
+                        item = await source.enrich_item(item)
 
                         ch = client.get_channel(ch_id)
 
