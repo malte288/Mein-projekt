@@ -1,6 +1,11 @@
 """
 Vinted source using a normal anonymous public web session.
 No Vinted login, CAPTCHA bypass, proxy rotation, or credential handling.
+
+Gallery/timer additions:
+- Basic catalog search stays fast.
+- Full item details are fetched only for an item that already matched
+  the profile filters, so the bot can get all photos + listing creation time.
 """
 
 import os
@@ -45,7 +50,6 @@ class VintedSource:
     async def search_new(self, query):
         session = await self._session()
 
-        # Establish a normal anonymous web session first.
         bootstrap_status = await self._bootstrap(session)
 
         params = {
@@ -78,6 +82,84 @@ class VintedSource:
             if isinstance(item, dict) and item.get("id")
         ]
 
+    async def enrich_item(self, item):
+        """
+        Fetches the public item-detail endpoint for one already-matched item.
+        This is used for the complete photo gallery and listing creation time.
+        """
+        item_id = item.get("id")
+        if not item_id:
+            return item
+
+        session = await self._session()
+
+        url = f"{self.base_url}/api/v2/items/{item_id}/details"
+
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return item
+
+                data = await response.json(content_type=None)
+
+            detail = data.get("item", data) if isinstance(data, dict) else {}
+            if not isinstance(detail, dict):
+                return item
+
+            photos = []
+            for photo in detail.get("photos", []) or []:
+                if not isinstance(photo, dict):
+                    continue
+                photo_url = (
+                    photo.get("full_size_url")
+                    or photo.get("url")
+                    or photo.get("high_resolution_url")
+                )
+                if photo_url:
+                    photos.append(photo_url)
+
+            # Keep order and remove duplicates.
+            photos = list(dict.fromkeys(photos))
+
+            item["image_urls"] = photos[:10]
+            item["created_at"] = (
+                detail.get("created_at_ts")
+                or detail.get("created_at")
+            )
+
+            item["url"] = detail.get("url") or item.get("url") or ""
+
+            # Prefer detail values if present.
+            item["title"] = detail.get("title") or item.get("title")
+            item["size"] = (
+                detail.get("size_title")
+                or detail.get("size")
+                or item.get("size")
+                or ""
+            )
+            item["condition"] = (
+                detail.get("status_title")
+                or detail.get("status")
+                or item.get("condition")
+                or ""
+            )
+            item["brand"] = (
+                detail.get("brand_title")
+                or item.get("brand")
+                or ""
+            )
+
+            price = detail.get("price")
+            if isinstance(price, dict):
+                price = price.get("amount")
+            if price is not None:
+                item["price"] = price
+
+        except Exception as e:
+            print(f"Detail fuer Vinted-Artikel {item_id} nicht geladen: {e}")
+
+        return item
+
     @staticmethod
     def _normalize(item):
         price = item.get("price")
@@ -96,6 +178,8 @@ class VintedSource:
             "condition": item.get("status") or item.get("status_title") or "",
             "brand": item.get("brand_title") or item.get("brand") or "",
             "image_url": image_url,
+            "image_urls": [],
+            "created_at": item.get("created_at_ts") or item.get("created_at"),
         }
 
     def matches(self, item, sizes, max_price, condition):
