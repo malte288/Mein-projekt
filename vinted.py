@@ -1,14 +1,15 @@
-"""
-Vinted source using a normal anonymous public web session.
-No Vinted login, CAPTCHA bypass, proxy rotation, or credential handling.
 
-Gallery/timer additions:
-- Basic catalog search stays fast.
-- Full item details are fetched only for an item that already matched
-  the profile filters, so the bot can get all photos + listing creation time.
+"""
+Vinted source using an anonymous public web session.
+
+No Vinted login, CAPTCHA bypass, proxy rotation, or credential handling.
+All HTTP text is kept in UTF-8; UI labels in the Discord bot are ASCII-safe
+to avoid the mojibake seen in the previous deployment.
 """
 
 import os
+from datetime import datetime, timezone
+
 import aiohttp
 
 
@@ -20,7 +21,10 @@ class VintedSource:
 
         self.base_url = f"https://{host}"
         self.per_page = max(20, min(96, int(os.getenv("VINTED_PER_PAGE", "96"))))
-        self.timeout_seconds = max(3.0, float(os.getenv("VINTED_TIMEOUT", "5")))
+        self.timeout_seconds = max(
+            3.0,
+            float(os.getenv("VINTED_TIMEOUT", "5")),
+        )
         self.session = None
 
     async def _session(self):
@@ -28,7 +32,10 @@ class VintedSource:
             self.session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
                 headers={
-                    "Accept": "text/html,application/xhtml+xml,application/json",
+                    "Accept": (
+                        "text/html,application/xhtml+xml,"
+                        "application/json"
+                    ),
                     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -76,6 +83,7 @@ class VintedSource:
             data = await response.json(content_type=None)
 
         items = data.get("items", []) if isinstance(data, dict) else []
+
         return [
             self._normalize(item)
             for item in items
@@ -84,90 +92,162 @@ class VintedSource:
 
     async def enrich_item(self, item):
         """
-        Fetches the public item-detail endpoint for one already-matched item.
-        This is used for the complete photo gallery and listing creation time.
+        Get the full item after it already passed the profile filters.
+
+        The details response commonly contains `photos` with all images.
+        If the detail endpoint is unavailable, the catalog result is kept.
         """
-        item_id = item.get("id")
-        if not item_id:
-            return item
-
         session = await self._session()
+        item_id = str(item["id"])
 
-        url = f"{self.base_url}/api/v2/items/{item_id}/details"
+        detail_urls = (
+            f"{self.base_url}/api/v2/items/{item_id}/details",
+            f"{self.base_url}/api/v2/items/{item_id}",
+        )
 
-        try:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    return item
+        for url in detail_urls:
+            try:
+                async with session.get(
+                    url,
+                    params={"localize": "true"},
+                ) as response:
+                    if response.status != 200:
+                        continue
 
-                data = await response.json(content_type=None)
+                    data = await response.json(content_type=None)
+                    detail = data.get("item", data) if isinstance(data, dict) else {}
 
-            detail = data.get("item", data) if isinstance(data, dict) else {}
-            if not isinstance(detail, dict):
-                return item
+                    if not isinstance(detail, dict):
+                        continue
 
-            photos = []
-            for photo in detail.get("photos", []) or []:
-                if not isinstance(photo, dict):
-                    continue
-                photo_url = (
-                    photo.get("full_size_url")
-                    or photo.get("url")
-                    or photo.get("high_resolution_url")
-                )
-                if photo_url:
-                    photos.append(photo_url)
+                    normalized = self._normalize(detail)
 
-            # Keep order and remove duplicates.
-            photos = list(dict.fromkeys(photos))
+                    # Keep catalog values if the detail endpoint omits them.
+                    for key, value in item.items():
+                        if not normalized.get(key) and value:
+                            normalized[key] = value
 
-            item["image_urls"] = photos[:10]
-            item["created_at"] = (
-                detail.get("created_at_ts")
-                or detail.get("created_at")
-            )
+                    # Prefer all detail photos.
+                    all_images = self._extract_images(detail)
+                    if all_images:
+                        normalized["image_urls"] = all_images
 
-            item["url"] = detail.get("url") or item.get("url") or ""
+                    return normalized
 
-            # Prefer detail values if present.
-            item["title"] = detail.get("title") or item.get("title")
-            item["size"] = (
-                detail.get("size_title")
-                or detail.get("size")
-                or item.get("size")
-                or ""
-            )
-            item["condition"] = (
-                detail.get("status_title")
-                or detail.get("status")
-                or item.get("condition")
-                or ""
-            )
-            item["brand"] = (
-                detail.get("brand_title")
-                or item.get("brand")
-                or ""
-            )
-
-            price = detail.get("price")
-            if isinstance(price, dict):
-                price = price.get("amount")
-            if price is not None:
-                item["price"] = price
-
-        except Exception as e:
-            print(f"Detail fuer Vinted-Artikel {item_id} nicht geladen: {e}")
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                continue
 
         return item
 
-    @staticmethod
-    def _normalize(item):
+    @classmethod
+    def _extract_images(cls, item):
+        urls = []
+
+        def add_url(value):
+            if not value:
+                return
+
+            if isinstance(value, str):
+                if value.startswith(("http://", "https://")):
+                    urls.append(value)
+                return
+
+            if isinstance(value, dict):
+                for key in (
+                    "url",
+                    "full_size_url",
+                    "full_size",
+                    "url_big",
+                    "url_large",
+                    "image_url",
+                ):
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and candidate.startswith(
+                        ("http://", "https://")
+                    ):
+                        urls.append(candidate)
+                        return
+
+        photos = item.get("photos")
+        if isinstance(photos, list):
+            for photo in photos:
+                add_url(photo)
+
+        # Some responses expose a single main photo as `photo`.
+        add_url(item.get("photo"))
+
+        # Other wrappers/responses use one of these names.
+        for key in ("images", "image_urls", "photo_urls"):
+            value = item.get(key)
+            if isinstance(value, list):
+                for entry in value:
+                    add_url(entry)
+
+        # Preserve order and remove duplicates.
+        result = []
+        seen = set()
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                result.append(url)
+
+        return result
+
+    @classmethod
+    def _parse_timestamp(cls, value):
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            # Vinted timestamps are normally seconds. Handle milliseconds too.
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts /= 1000
+            return int(ts)
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+
+            try:
+                numeric = float(text)
+                if numeric > 10_000_000_000:
+                    numeric /= 1000
+                return int(numeric)
+            except ValueError:
+                pass
+
+            try:
+                normalized = text.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp())
+            except ValueError:
+                return None
+
+        return None
+
+    @classmethod
+    def _normalize(cls, item):
         price = item.get("price")
         if isinstance(price, dict):
             price = price.get("amount")
 
-        photo = item.get("photo")
-        image_url = photo.get("url") if isinstance(photo, dict) else None
+        image_urls = cls._extract_images(item)
+        image_url = image_urls[0] if image_urls else None
+
+        created_at = None
+        for key in (
+            "created_at_ts",
+            "created_at",
+            "upload_date",
+            "created_at_timestamp",
+        ):
+            created_at = cls._parse_timestamp(item.get(key))
+            if created_at:
+                break
 
         return {
             "id": str(item.get("id")),
@@ -175,11 +255,15 @@ class VintedSource:
             "url": item.get("url") or "",
             "price": price,
             "size": item.get("size_title") or item.get("size") or "",
-            "condition": item.get("status") or item.get("status_title") or "",
+            "condition": (
+                item.get("status")
+                or item.get("status_title")
+                or ""
+            ),
             "brand": item.get("brand_title") or item.get("brand") or "",
             "image_url": image_url,
-            "image_urls": [],
-            "created_at": item.get("created_at_ts") or item.get("created_at"),
+            "image_urls": image_urls,
+            "created_at_ts": created_at,
         }
 
     def matches(self, item, sizes, max_price, condition):
