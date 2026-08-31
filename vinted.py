@@ -1,29 +1,44 @@
 """
-Vinted source using the public Vinted catalog pages.
+Vinted source.
 
-- No Vinted login
-- No CAPTCHA bypass
-- No proxy rotation
-- No credential handling
-- Catalog search reads the public HTML page
-- Item details are fetched only after an item matches
-- Supports multiple photos
-- Tries to extract description + creation time
+- Anonymous public session
+- Keeps the same aiohttp session + cookies
+- Bootstraps the session from the public catalog
+- Retries once with a fresh session after HTTP 401
+- Does NOT bypass CAPTCHA / challenges
+- Does NOT use proxies
+- Does NOT use Vinted login credentials
+- Keeps the existing bot interface:
+    search_new()
+    enrich_item()
+    matches()
+    close()
+
+Gallery:
+- image_urls
+- image_url
+
+Details:
+- title
+- price
+- size
+- condition
+- brand
+- description
+- created_at
 """
 
 import os
-import json
-import re
 import asyncio
-from datetime import datetime, timezone
-from urllib.parse import urlencode, urljoin
-
 import aiohttp
 
 
 class VintedSource:
     def __init__(self):
-        domain = os.getenv("VINTED_DOMAIN", "de").strip().lower()
+        domain = os.getenv(
+            "VINTED_DOMAIN",
+            "de",
+        ).strip().lower()
 
         domain = (
             domain
@@ -44,185 +59,238 @@ class VintedSource:
             20,
             min(
                 96,
-                int(os.getenv("VINTED_PER_PAGE", "96"))
+                int(
+                    os.getenv(
+                        "VINTED_PER_PAGE",
+                        "96",
+                    )
+                ),
             ),
         )
 
         self.timeout_seconds = max(
             3.0,
-            float(os.getenv("VINTED_TIMEOUT", "8"))
+            float(
+                os.getenv(
+                    "VINTED_TIMEOUT",
+                    "8",
+                )
+            ),
         )
 
         self.session = None
 
-    # ---------------------------------------------------------
-    # HTTP SESSION
-    # ---------------------------------------------------------
+        # Prevent several simultaneous searches from all trying
+        # to create a new Vinted session at the same time.
+        self.session_lock = asyncio.Lock()
 
-    async def _session(self):
-        if self.session is None or self.session.closed:
+    # =========================================================
+    # SESSION
+    # =========================================================
 
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(
-                    total=self.timeout_seconds
+    async def _create_session(self):
+        """
+        Creates a completely fresh anonymous HTTP session.
+
+        aiohttp keeps Set-Cookie values automatically inside the
+        ClientSession cookie jar.
+        """
+
+        if self.session is not None:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=self.timeout_seconds
+            ),
+            cookie_jar=aiohttp.CookieJar(),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
                 ),
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": (
-                        "text/html,application/xhtml+xml,"
-                        "application/xml;q=0.9,image/avif,"
-                        "image/webp,*/*;q=0.8"
-                    ),
-                    "Accept-Language": (
-                        "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
-                    ),
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache",
-                },
-            )
+                "Accept": (
+                    "text/html,application/xhtml+xml,"
+                    "application/json;q=0.9,*/*;q=0.8"
+                ),
+                "Accept-Language": (
+                    "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+                ),
+                "Connection": "keep-alive",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
 
         return self.session
 
-    # ---------------------------------------------------------
-    # PUBLIC CATALOG URL
-    # ---------------------------------------------------------
+    async def _session(self):
+        """
+        Returns the current session.
 
-    def _catalog_url(self, query, page=1):
+        If none exists, bootstrap a fresh one.
+        """
+
+        if (
+            self.session is None
+            or self.session.closed
+        ):
+            async with self.session_lock:
+                if (
+                    self.session is None
+                    or self.session.closed
+                ):
+                    await self._bootstrap()
+
+        return self.session
+
+    # =========================================================
+    # BOOTSTRAP
+    # =========================================================
+
+    async def _bootstrap(self):
+        """
+        Loads the public Vinted catalog page first.
+
+        Vinted sets anonymous session cookies during this request.
+        Those cookies remain inside the same aiohttp session and
+        are then used for the JSON catalog request.
+        """
+
+        session = await self._create_session()
+
+        url = f"{self.base_url}/catalog"
+
+        params = {
+            "order": "newest_first",
+        }
+
+        try:
+            async with session.get(
+                url,
+                params=params,
+                allow_redirects=True,
+            ) as response:
+
+                status = response.status
+
+                # Consume the response so the connection can be
+                # reused by aiohttp.
+                await response.read()
+
+                print(
+                    f"[VINTED] Session bootstrap: HTTP {status}"
+                )
+
+                if status == 401:
+                    raise RuntimeError(
+                        "Vinted rejected the anonymous catalog "
+                        "session with HTTP 401."
+                    )
+
+                if status == 403:
+                    raise RuntimeError(
+                        "Vinted rejected the anonymous catalog "
+                        "session with HTTP 403."
+                    )
+
+                if status == 429:
+                    raise RuntimeError(
+                        "Vinted rate limited the catalog session "
+                        "with HTTP 429."
+                    )
+
+                if status != 200:
+                    raise RuntimeError(
+                        f"Vinted catalog bootstrap HTTP {status}"
+                    )
+
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                "Vinted catalog bootstrap timed out."
+            )
+
+    # =========================================================
+    # CATALOG SEARCH
+    # =========================================================
+
+    async def _catalog_request(self, query):
+        """
+        Performs one catalog API request using the current
+        anonymous session.
+        """
+
+        session = await self._session()
+
         params = {
             "search_text": query,
             "order": "newest_first",
-            "page": page,
+            "page": 1,
             "per_page": self.per_page,
+            "currency": "EUR",
         }
 
-        return (
-            f"{self.base_url}/catalog?"
-            f"{urlencode(params)}"
-        )
-
-    # ---------------------------------------------------------
-    # JSON ARRAY EXTRACTION
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _extract_json_array_after_key(text, key):
-        """
-        Finds:
-
-            "items":[...]
-
-        inside the Vinted HTML and lets Python's JSON decoder
-        determine where the array actually ends.
-
-        This is considerably safer than using a greedy regex.
-        """
-
-        patterns = [
-            f'"{key}":',
-            f'"{key}" :',
-        ]
-
-        start = -1
-
-        for pattern in patterns:
-            start = text.find(pattern)
-
-            if start != -1:
-                start += len(pattern)
-                break
-
-        if start == -1:
-            return None
-
-        while start < len(text) and text[start].isspace():
-            start += 1
-
-        if start >= len(text):
-            return None
-
-        if text[start] != "[":
-            return None
-
-        try:
-            decoder = json.JSONDecoder()
-
-            value, _ = decoder.raw_decode(
-                text[start:]
-            )
-
-            if isinstance(value, list):
-                return value
-
-        except Exception:
-            return None
-
-        return None
-
-    # ---------------------------------------------------------
-    # CATALOG HTML
-    # ---------------------------------------------------------
-
-    async def _fetch_catalog_html(self, query):
-        session = await self._session()
-
-        url = self._catalog_url(
-            query=query,
-            page=1,
+        url = (
+            f"{self.base_url}"
+            "/api/v2/catalog/items"
         )
 
         async with session.get(
             url,
+            params=params,
             allow_redirects=True,
         ) as response:
 
             status = response.status
-            text = await response.text(
-                errors="replace"
-            )
+
+            if status == 200:
+                data = await response.json(
+                    content_type=None
+                )
+
+                if not isinstance(data, dict):
+                    raise RuntimeError(
+                        "Vinted returned an unexpected "
+                        "catalog response."
+                    )
+
+                return data
 
             if status == 401:
                 raise RuntimeError(
-                    "Vinted HTTP 401 auf der öffentlichen "
-                    "Katalogseite."
+                    "VINTED_401"
                 )
 
             if status == 403:
                 raise RuntimeError(
-                    "Vinted HTTP 403 auf der öffentlichen "
-                    "Katalogseite."
+                    "VINTED_403"
                 )
 
             if status == 429:
                 raise RuntimeError(
-                    "Vinted HTTP 429 - zu viele Anfragen."
+                    "VINTED_429"
                 )
 
-            if status != 200:
-                raise RuntimeError(
-                    f"Vinted HTTP {status}"
-                )
-
-            return text
-
-    # ---------------------------------------------------------
-    # SEARCH
-    # ---------------------------------------------------------
+            raise RuntimeError(
+                f"Vinted HTTP {status}"
+            )
 
     async def search_new(self, query):
         """
-        Searches the public Vinted catalog.
+        Searches newest Vinted listings.
 
-        IMPORTANT:
-        This no longer calls:
+        On HTTP 401:
+            refresh anonymous session once
+            retry once
 
-            /api/v2/catalog/items
+        On HTTP 403 / 429:
+            stop immediately and report the problem.
 
-        because that endpoint currently returns HTTP 401
-        for the anonymous Railway session.
+        This intentionally does not attempt to bypass a challenge.
         """
 
         query = (query or "").strip()
@@ -230,72 +298,84 @@ class VintedSource:
         if not query:
             return []
 
-        html = await self._fetch_catalog_html(
-            query
-        )
+        # First attempt.
+        try:
+            data = await self._catalog_request(
+                query
+            )
 
-        items = self._extract_json_array_after_key(
-            html,
-            "items",
-        )
+        except RuntimeError as error:
 
-        if items is None:
+            message = str(error)
 
-            # Helpful diagnostics in Railway logs.
-            lowered = html.lower()
+            # -------------------------------------------------
+            # SESSION EXPIRED
+            # -------------------------------------------------
 
-            if (
-                "captcha" in lowered
-                or "challenge" in lowered
-                or "datadome" in lowered
-                or "cf-mitigated" in lowered
-            ):
-                raise RuntimeError(
-                    "Vinted hat eine Challenge/Anti-Bot-Seite "
-                    "statt des Katalogs geliefert."
+            if message == "VINTED_401":
+
+                print(
+                    "[VINTED] HTTP 401 - "
+                    "refreshing anonymous session."
                 )
 
-            raise RuntimeError(
-                "Vinted-Katalog konnte geladen werden, "
-                "aber die eingebetteten Artikel konnten "
-                "nicht gefunden werden."
-            )
+                async with self.session_lock:
 
-        normalized = []
+                    # Another coroutine may already have refreshed
+                    # the session while we waited for the lock.
+                    #
+                    # For safety, create a fresh session here.
+                    await self._bootstrap()
 
-        for item in items:
+                try:
+                    data = await self._catalog_request(
+                        query
+                    )
 
-            if not isinstance(item, dict):
+                except RuntimeError as retry_error:
+
+                    print(
+                        "[VINTED] Retry after session refresh "
+                        f"failed: {retry_error}"
+                    )
+
+                    raise
+
+            else:
+                raise
+
+        items = (
+            data.get("items", [])
+            if isinstance(data, dict)
+            else []
+        )
+
+        results = []
+
+        for raw_item in items:
+
+            if not isinstance(raw_item, dict):
                 continue
 
-            if not item.get("id"):
+            if not raw_item.get("id"):
                 continue
 
-            normalized.append(
-                self._normalize(item)
+            results.append(
+                self._normalize(raw_item)
             )
 
-        return normalized
+        return results
 
-    # ---------------------------------------------------------
-    # ITEM DETAIL PAGE
-    # ---------------------------------------------------------
+    # =========================================================
+    # ITEM DETAILS
+    # =========================================================
 
     async def enrich_item(self, item):
         """
-        Loads the public Vinted item page only after the item
-        already matched the profile.
+        Fetches the public item detail endpoint for a matched item.
 
-        Attempts to collect:
-
-        - all available image URLs
-        - description
-        - creation/publication time
-        - title
-        - size
-        - condition
-        - brand
-        - price
+        This is intentionally called only after the normal
+        catalog filters have matched the item.
         """
 
         item_id = item.get("id")
@@ -305,284 +385,232 @@ class VintedSource:
 
         session = await self._session()
 
-        item_url = item.get("url")
+        # Keep compatibility with the previous implementation.
+        urls = [
+            f"{self.base_url}"
+            f"/api/v2/items/{item_id}/details",
 
-        if not item_url:
-            item_url = (
-                f"{self.base_url}/items/{item_id}"
-            )
+            f"{self.base_url}"
+            f"/api/v2/items/{item_id}",
+        ]
 
-        try:
-            async with session.get(
-                item_url,
-                allow_redirects=True,
-            ) as response:
+        for url in urls:
 
-                if response.status != 200:
-                    print(
-                        f"[DETAIL] Vinted HTTP "
-                        f"{response.status} für {item_id}"
-                    )
+            try:
+                async with session.get(
+                    url,
+                    allow_redirects=True,
+                ) as response:
 
-                    return item
-
-                html = await response.text(
-                    errors="replace"
-                )
-
-            # -------------------------------------------------
-            # PHOTOS
-            # -------------------------------------------------
-
-            photos = []
-
-            # Vinted image URLs are usually visible in the
-            # public item HTML.
-            image_matches = re.findall(
-                r'https://images\d+\.vinted\.net/[^"\'<>\s\\]+',
-                html,
-            )
-
-            for image_url in image_matches:
-
-                image_url = (
-                    image_url
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-                )
-
-                if image_url not in photos:
-                    photos.append(image_url)
-
-            # Also try common JSON image fields.
-            extra_patterns = [
-                r'"full_size_url":"([^"]+)"',
-                r'"high_resolution_url":"([^"]+)"',
-                r'"image_url":"([^"]+)"',
-                r'"url":"(https://images\d+\.vinted\.net/[^"]+)"',
-            ]
-
-            for pattern in extra_patterns:
-
-                matches = re.findall(
-                    pattern,
-                    html,
-                )
-
-                for image_url in matches:
-
-                    image_url = (
-                        image_url
-                        .replace("\\/", "/")
-                        .replace("\\u0026", "&")
-                    )
-
-                    if (
-                        image_url
-                        and image_url not in photos
-                    ):
-                        photos.append(image_url)
-
-            # Remove duplicates while preserving order.
-            photos = list(dict.fromkeys(photos))
-
-            item["image_urls"] = photos[:10]
-
-            if photos:
-                item["image_url"] = photos[0]
-
-            # -------------------------------------------------
-            # JSON-LD
-            # -------------------------------------------------
-
-            json_ld_blocks = re.findall(
-                r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>'
-                r'(.*?)'
-                r'</script>',
-                html,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-
-            json_ld_objects = []
-
-            for block in json_ld_blocks:
-
-                block = block.strip()
-
-                if not block:
-                    continue
-
-                try:
-                    parsed = json.loads(block)
-
-                    if isinstance(parsed, list):
-                        json_ld_objects.extend(
-                            parsed
+                    if response.status == 401:
+                        print(
+                            f"[DETAIL] HTTP 401 for {item_id}"
                         )
-                    else:
-                        json_ld_objects.append(
-                            parsed
-                        )
+                        return item
 
-                except Exception:
-                    continue
+                    if response.status != 200:
+                        continue
 
-            for data in json_ld_objects:
+                    data = await response.json(
+                        content_type=None
+                    )
 
                 if not isinstance(data, dict):
-                    continue
+                    return item
 
-                # -------------------------------------------------
-                # TITLE
-                # -------------------------------------------------
-
-                if data.get("name"):
-                    item["title"] = data["name"]
-
-                # -------------------------------------------------
-                # DESCRIPTION
-                # -------------------------------------------------
-
-                if data.get("description"):
-                    item["description"] = (
-                        str(data["description"]).strip()
-                    )
-
-                # -------------------------------------------------
-                # CREATED / PUBLISHED
-                # -------------------------------------------------
-
-                if data.get("datePublished"):
-                    item["created_at"] = (
-                        data["datePublished"]
-                    )
-
-                # -------------------------------------------------
-                # URL
-                # -------------------------------------------------
-
-                if data.get("url"):
-                    item["url"] = data["url"]
-
-                # -------------------------------------------------
-                # IMAGE
-                # -------------------------------------------------
-
-                images = data.get("image")
-
-                if isinstance(images, str):
-
-                    if images not in photos:
-                        photos.append(images)
-
-                elif isinstance(images, list):
-
-                    for image in images:
-
-                        if (
-                            isinstance(image, str)
-                            and image not in photos
-                        ):
-                            photos.append(image)
-
-            item["image_urls"] = list(
-                dict.fromkeys(photos)
-            )[:10]
-
-            if item["image_urls"]:
-                item["image_url"] = (
-                    item["image_urls"][0]
+                detail = data.get(
+                    "item",
+                    data,
                 )
 
-            # -------------------------------------------------
-            # META FALLBACKS
-            # -------------------------------------------------
+                if not isinstance(detail, dict):
+                    return item
 
-            title = self._meta_content(
-                html,
-                "og:title",
-            )
-
-            if title:
-                item["title"] = title
-
-            description = self._meta_content(
-                html,
-                "description",
-            )
-
-            if description:
-                item["description"] = (
-                    item.get("description")
-                    or description
+                self._merge_details(
+                    item,
+                    detail,
                 )
 
-            canonical = self._meta_content(
-                html,
-                "og:url",
-            )
+                return item
 
-            if canonical:
-                item["url"] = canonical
+            except asyncio.TimeoutError:
 
-        except asyncio.TimeoutError:
+                print(
+                    f"[DETAIL] Timeout for "
+                    f"Vinted item {item_id}"
+                )
 
-            print(
-                f"[DETAIL] Timeout für Vinted-Artikel "
-                f"{item_id}"
-            )
+                return item
 
-        except Exception as e:
+            except Exception as error:
 
-            print(
-                f"[DETAIL] Artikel {item_id} "
-                f"nicht geladen: {e}"
-            )
+                print(
+                    f"[DETAIL] Item {item_id} "
+                    f"could not be loaded: {error}"
+                )
+
+                return item
 
         return item
 
-    # ---------------------------------------------------------
-    # META CONTENT
-    # ---------------------------------------------------------
+    # =========================================================
+    # DETAIL MERGE
+    # =========================================================
 
     @staticmethod
-    def _meta_content(html, name):
-        patterns = [
-            rf'<meta[^>]+property=["\']{re.escape(name)}'
-            rf'["\'][^>]+content=["\']([^"\']*)["\']',
+    def _merge_details(
+        item,
+        detail,
+    ):
+        # -----------------------------------------------------
+        # PHOTOS
+        # -----------------------------------------------------
 
-            rf'<meta[^>]+name=["\']{re.escape(name)}'
-            rf'["\'][^>]+content=["\']([^"\']*)["\']',
+        photos = []
 
-            rf'<meta[^>]+content=["\']([^"\']*)["\']'
-            rf'[^>]+property=["\']{re.escape(name)}'
-            rf'["\']',
-        ]
+        raw_photos = (
+            detail.get("photos")
+            or detail.get("images")
+            or []
+        )
 
-        for pattern in patterns:
+        if isinstance(raw_photos, list):
 
-            match = re.search(
-                pattern,
-                html,
-                flags=re.IGNORECASE,
+            for photo in raw_photos:
+
+                if isinstance(photo, str):
+
+                    value = photo
+
+                elif isinstance(photo, dict):
+
+                    value = (
+                        photo.get("full_size_url")
+                        or photo.get("high_resolution_url")
+                        or photo.get("url")
+                    )
+
+                else:
+
+                    value = None
+
+                if value:
+                    value = str(value)
+
+                    if value not in photos:
+                        photos.append(value)
+
+        # Keep the existing main image as a fallback.
+        existing = item.get("image_url")
+
+        if existing and existing not in photos:
+            photos.insert(
+                0,
+                existing,
             )
 
-            if match:
-                return (
-                    match.group(1)
-                    .replace("&amp;", "&")
-                    .replace("&quot;", '"')
-                    .strip()
-                )
+        item["image_urls"] = photos[:10]
 
-        return None
+        if item["image_urls"]:
+            item["image_url"] = (
+                item["image_urls"][0]
+            )
 
-    # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # TITLE
+        # -----------------------------------------------------
+
+        item["title"] = (
+            detail.get("title")
+            or item.get("title")
+            or "Vinted-Angebot"
+        )
+
+        # -----------------------------------------------------
+        # DESCRIPTION
+        # -----------------------------------------------------
+
+        item["description"] = (
+            detail.get("description")
+            or item.get("description")
+            or ""
+        )
+
+        # -----------------------------------------------------
+        # URL
+        # -----------------------------------------------------
+
+        item["url"] = (
+            detail.get("url")
+            or item.get("url")
+            or ""
+        )
+
+        # -----------------------------------------------------
+        # SIZE
+        # -----------------------------------------------------
+
+        item["size"] = (
+            detail.get("size_title")
+            or detail.get("size")
+            or item.get("size")
+            or ""
+        )
+
+        # -----------------------------------------------------
+        # CONDITION
+        # -----------------------------------------------------
+
+        item["condition"] = (
+            detail.get("status_title")
+            or detail.get("status")
+            or item.get("condition")
+            or ""
+        )
+
+        # -----------------------------------------------------
+        # BRAND
+        # -----------------------------------------------------
+
+        item["brand"] = (
+            detail.get("brand_title")
+            or detail.get("brand")
+            or item.get("brand")
+            or ""
+        )
+
+        # -----------------------------------------------------
+        # PRICE
+        # -----------------------------------------------------
+
+        price = detail.get("price")
+
+        if isinstance(price, dict):
+            price = price.get("amount")
+
+        if price is not None:
+            item["price"] = price
+
+        # -----------------------------------------------------
+        # CREATION TIME
+        # -----------------------------------------------------
+
+        item["created_at"] = (
+            detail.get("created_at_ts")
+            or detail.get("created_at")
+            or item.get("created_at")
+        )
+
+    # =========================================================
     # NORMALIZE CATALOG ITEM
-    # ---------------------------------------------------------
+    # =========================================================
 
     @staticmethod
     def _normalize(item):
+
+        # -----------------------------------------------------
+        # PRICE
+        # -----------------------------------------------------
 
         price = item.get("price")
 
@@ -590,12 +618,12 @@ class VintedSource:
             price = price.get("amount")
 
         # -----------------------------------------------------
-        # MAIN PHOTO
+        # MAIN IMAGE
         # -----------------------------------------------------
 
-        photo = item.get("photo")
-
         image_url = None
+
+        photo = item.get("photo")
 
         if isinstance(photo, dict):
 
@@ -610,7 +638,7 @@ class VintedSource:
             image_url = photo
 
         # -----------------------------------------------------
-        # PHOTO LIST
+        # IMAGE LIST
         # -----------------------------------------------------
 
         image_urls = []
@@ -623,29 +651,29 @@ class VintedSource:
 
         if isinstance(raw_photos, list):
 
-            for entry in raw_photos:
+            for photo in raw_photos:
 
-                if isinstance(entry, str):
+                if isinstance(photo, str):
 
-                    value = entry
+                    value = photo
 
-                elif isinstance(entry, dict):
+                elif isinstance(photo, dict):
 
                     value = (
-                        entry.get("url")
-                        or entry.get("full_size_url")
-                        or entry.get("high_resolution_url")
+                        photo.get("url")
+                        or photo.get("full_size_url")
+                        or photo.get("high_resolution_url")
                     )
 
                 else:
 
                     value = None
 
-                if value and value not in image_urls:
+                if value:
+                    value = str(value)
 
-                    image_urls.append(
-                        str(value)
-                    )
+                    if value not in image_urls:
+                        image_urls.append(value)
 
         if (
             image_url
@@ -656,31 +684,20 @@ class VintedSource:
                 image_url,
             )
 
-        # -----------------------------------------------------
-        # URL
-        # -----------------------------------------------------
-
-        url = item.get("url") or ""
-
-        if url.startswith("/"):
-            url = urljoin(
-                "https://www.vinted.de",
-                url,
-            )
-
-        # -----------------------------------------------------
-        # NORMALIZED ITEM
-        # -----------------------------------------------------
-
         return {
-            "id": str(item.get("id")),
+            "id": str(
+                item.get("id")
+            ),
 
             "title": (
                 item.get("title")
                 or "Vinted-Angebot"
             ),
 
-            "url": url,
+            "url": (
+                item.get("url")
+                or ""
+            ),
 
             "price": price,
 
@@ -717,9 +734,9 @@ class VintedSource:
             ),
         }
 
-    # ---------------------------------------------------------
-    # FILTER
-    # ---------------------------------------------------------
+    # =========================================================
+    # PROFILE FILTERS
+    # =========================================================
 
     def matches(
         self,
@@ -728,21 +745,27 @@ class VintedSource:
         max_price,
         condition,
     ):
-
         # -----------------------------------------------------
         # SIZE
         # -----------------------------------------------------
 
         wanted_sizes = {
-            x.strip().lower()
-            for x in (sizes or "").split(",")
-            if x.strip()
+            value.strip().lower()
+            for value in (
+                sizes or ""
+            ).split(",")
+            if value.strip()
         }
 
         if wanted_sizes:
 
             item_size = (
-                str(item.get("size", ""))
+                str(
+                    item.get(
+                        "size",
+                        "",
+                    )
+                )
                 .strip()
                 .lower()
             )
@@ -781,7 +804,9 @@ class VintedSource:
         if condition:
 
             wanted_condition = (
-                condition.strip().lower()
+                condition
+                .strip()
+                .lower()
             )
 
             actual_condition = (
@@ -803,9 +828,9 @@ class VintedSource:
 
         return True
 
-    # ---------------------------------------------------------
+    # =========================================================
     # CLOSE
-    # ---------------------------------------------------------
+    # =========================================================
 
     async def close(self):
 
@@ -813,5 +838,6 @@ class VintedSource:
             self.session is not None
             and not self.session.closed
         ):
-
             await self.session.close()
+
+        self.session = None
